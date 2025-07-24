@@ -44,7 +44,7 @@ ClawTree creates a `.clawtree-sessions/` directory in your git repository root, 
 
 ## 🤝 Contributing
 
-Issues and pull requests are welcome! Visit the [GitHub repository](https://github.com/joshuamullet/clawtree).
+Issues and pull requests are welcome! Visit the [GitHub repository](https://github.com/joshua-mullet-town/clawtree).
 
 ## 📄 License
 

@@ -3,13 +3,13 @@
   "version": "1.0.0",
   "description": "A minimal Claude Code worktree manager with a terminal UI",
   "keywords": ["git", "worktree", "cli", "terminal", "development", "claude"],
-  "homepage": "https://github.com/joshuamullet/clawtree#readme",
+  "homepage": "https://github.com/joshua-mullet-town/clawtree#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/joshuamullet/clawtree.git"
+    "url": "https://github.com/joshua-mullet-town/clawtree.git"
   },
   "bugs": {
-    "url": "https://github.com/joshuamullet/clawtree/issues"
+    "url": "https://github.com/joshua-mullet-town/clawtree/issues"
   },
   "bin": {
     "clawtree": "./bin/clawtree"

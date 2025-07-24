@@ -24,7 +24,7 @@ git add .
 git commit -m "Initial commit: ClawTree CLI with auto-publishing setup"
 
 # Add remote and push
-git remote add origin https://github.com/joshuamullet/clawtree.git
+git remote add origin https://github.com/joshua-mullet-town/clawtree.git
 git branch -M main
 git push -u origin main
 ```
@@ -38,7 +38,7 @@ git push -u origin main
 6. Copy the token (starts with `npm_`)
 
 ### 4. Add NPM Token to GitHub Secrets
-1. Go to your GitHub repo: https://github.com/joshuamullet/clawtree
+1. Go to your GitHub repo: https://github.com/joshua-mullet-town/clawtree
 2. Click "Settings" tab
 3. In sidebar, click "Secrets and variables" → "Actions"
 4. Click "New repository secret"
@@ -89,9 +89,9 @@ npm install -g clawtree
 
 ## 🔍 Monitoring
 
-- Check GitHub Actions: https://github.com/joshuamullet/clawtree/actions
+- Check GitHub Actions: https://github.com/joshua-mullet-town/clawtree/actions
 - Check NPM package: https://www.npmjs.com/package/clawtree
-- View releases: https://github.com/joshuamullet/clawtree/releases
+- View releases: https://github.com/joshua-mullet-town/clawtree/releases
 
 ## 🐛 Troubleshooting
 
