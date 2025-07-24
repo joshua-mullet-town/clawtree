@@ -1,0 +1,30 @@
+# Source control
+.git/
+.github/
+
+# Development files
+test/
+tests/
+*.test.js
+*.spec.js
+
+# Logs
+*.log
+
+# Coverage
+coverage/
+
+# Environment files
+.env*
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary
+tmp/
+temp/

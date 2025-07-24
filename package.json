@@ -1,0 +1,36 @@
+{
+  "name": "clawtree",
+  "version": "1.0.0",
+  "description": "A minimal Claude Code worktree manager with a terminal UI",
+  "keywords": ["git", "worktree", "cli", "terminal", "development", "claude"],
+  "homepage": "https://github.com/joshuamullet/clawtree#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joshuamullet/clawtree.git"
+  },
+  "bugs": {
+    "url": "https://github.com/joshuamullet/clawtree/issues"
+  },
+  "bin": {
+    "clawtree": "./bin/clawtree"
+  },
+  "files": [
+    "bin/",
+    "CLAUDE.md",
+    "README.md"
+  ],
+  "scripts": {
+    "patch": "npm version patch",
+    "minor": "npm version minor", 
+    "major": "npm version major",
+    "prepublishOnly": "echo 'Publishing clawtree...'",
+    "postversion": "git push && git push --tags"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "os": ["darwin", "linux"],
+  "preferGlobal": true,
+  "author": "Joshua Mullet",
+  "license": "MIT"
+}

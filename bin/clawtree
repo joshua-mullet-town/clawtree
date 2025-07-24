@@ -1,0 +1,184 @@
+#!/bin/bash
+
+ROOT_REPO=$(git rev-parse --show-toplevel 2>/dev/null)
+if [[ -z "$ROOT_REPO" ]]; then
+  echo "🚫 Not inside a git repository."
+  exit 1
+fi
+
+SESSIONS_DIR="$ROOT_REPO/.clawtree-sessions"
+CONFIG_FILE="$ROOT_REPO/.clawtree-config"
+
+mkdir -p "$SESSIONS_DIR"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  source "$CONFIG_FILE"
+else
+  DEFAULT_BASE_BRANCH="main"
+fi
+
+function list_sessions_array() {
+  ls "$SESSIONS_DIR" 2>/dev/null
+}
+
+function detect_default_branch() {
+  # Try to get the remote HEAD first
+  local remote_head=$(git -C "$ROOT_REPO" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+  if [[ -n "$remote_head" ]] && git -C "$ROOT_REPO" show-ref --verify --quiet "refs/heads/$remote_head"; then
+    echo "$remote_head"
+    return
+  fi
+  
+  # Fallback to common branch names that exist locally
+  for branch in main master develop development; do
+    if git -C "$ROOT_REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+      echo "$branch"
+      return
+    fi
+  done
+  
+  # Last resort: get the first local branch
+  local first_branch=$(git -C "$ROOT_REPO" branch --format='%(refname:short)' | head -n1)
+  if [[ -n "$first_branch" ]]; then
+    echo "$first_branch"
+  else
+    echo "main"  # Ultimate fallback
+  fi
+}
+
+function validate_branch_exists() {
+  local branch="$1"
+  git -C "$ROOT_REPO" show-ref --verify --quiet "refs/heads/$branch"
+}
+
+function list_available_branches() {
+  git -C "$ROOT_REPO" branch --format='%(refname:short)' | tr '\n' ', ' | sed 's/, $//'
+}
+
+function create_session() {
+  # Get branch name
+  branch=$(gum input --placeholder "New branch name (e.g. fix/gh-1083)")
+  if [ -z "$branch" ]; then
+    echo "🚫 No branch name provided."
+    return
+  fi
+
+  # Detect smart default and update DEFAULT_BASE_BRANCH if needed
+  if [[ -z "$DEFAULT_BASE_BRANCH" ]] || [[ "$DEFAULT_BASE_BRANCH" == "main" ]]; then
+    smart_default=$(detect_default_branch)
+    if [[ "$smart_default" != "$DEFAULT_BASE_BRANCH" ]]; then
+      DEFAULT_BASE_BRANCH="$smart_default"
+    fi
+  fi
+
+  while true; do
+    # Show clear prompt with helper text
+    base=$(gum input --header "Which branch should this new worktree branch from?" --placeholder "Base branch to create from" --value "$DEFAULT_BASE_BRANCH")
+    if [ -z "$base" ]; then
+      echo "🚫 No base branch provided."
+      return
+    fi
+
+    # Validate that the branch exists
+    if validate_branch_exists "$base"; then
+      break
+    else
+      available_branches=$(list_available_branches)
+      echo "❌ Branch '$base' does not exist. Available branches: $available_branches"
+      
+      retry_choice=$(gum choose --header "What would you like to do?" "🔄 Try again" "❌ Cancel")
+      if [[ "$retry_choice" == "❌ Cancel" ]]; then
+        return
+      fi
+      # Continue loop to try again
+    fi
+  done
+
+  # Save new default if different
+  if [[ "$base" != "$DEFAULT_BASE_BRANCH" ]]; then
+    echo "DEFAULT_BASE_BRANCH=$base" > "$CONFIG_FILE"
+    echo "📁 Saved '$base' as default base branch for this repo."
+    DEFAULT_BASE_BRANCH="$base"
+  fi
+
+  # Create the worktree
+  path="$SESSIONS_DIR/$(echo $branch | tr '/' '-')"
+  if git -C "$ROOT_REPO" worktree add "$path" -b "$branch" "$base" 2>/dev/null; then
+    echo "✅ Worktree created: $path (from $base)"
+    open_session "$(basename "$path")"
+  else
+    echo "❌ Failed to create worktree. The branch '$branch' may already exist."
+  fi
+}
+
+function delete_session() {
+  session="$1"
+  path="$SESSIONS_DIR/$session"
+
+  gum confirm "Delete session '$session'?" && {
+    git -C "$ROOT_REPO" worktree remove "$path"
+    git -C "$ROOT_REPO" branch -D "$(echo "$session" | tr '-' '/')"
+    echo "❌ Deleted $session"
+  }
+}
+
+function open_session() {
+  session="$1"
+  path="$SESSIONS_DIR/$session"
+
+  osascript <<EOF
+tell application "Terminal"
+  do script "cd \"$path\" && claude"
+  activate
+end tell
+EOF
+}
+
+function open_vscode() {
+  session="$1"
+  path="$SESSIONS_DIR/$session"
+  code "$path"
+}
+
+function dashboard() {
+  while true; do
+    options=()
+    while IFS= read -r session; do
+      options+=("$session")
+    done < <(list_sessions_array)
+
+    options+=("➕ New Session")
+    options+=("❌ Exit")
+
+    choice=$(printf "%s\n" "${options[@]}" | gum choose --header="🧠 Clawtree Sessions")
+
+    if [[ "$choice" == "➕ New Session" ]]; then
+      create_session
+    elif [[ "$choice" == "❌ Exit" ]]; then
+      break
+    elif [[ -n "$choice" ]]; then
+      gum style --bold "Selected: $choice"
+      action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "🗑️ Delete Session" "❌ Cancel")
+
+      case $action in
+        "💬 Launch Claude")
+          open_session "$choice"
+          ;;
+        "💻 Open in VS Code")
+          open_vscode "$choice"
+          ;;
+        "🤖 Launch Both")
+          open_vscode "$choice"
+          open_session "$choice"
+          ;;
+        "🗑️ Delete Session")
+          delete_session "$choice"
+          ;;
+        "❌ Cancel")
+          ;;
+      esac
+    fi
+  done
+}
+
+dashboard
