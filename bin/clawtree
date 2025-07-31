@@ -55,6 +55,67 @@ function list_available_branches() {
   git -C "$ROOT_REPO" branch --format='%(refname:short)' | tr '\n' ', ' | sed 's/, $//'
 }
 
+function get_latest_tag() {
+  git -C "$ROOT_REPO" describe --tags --abbrev=0 2>/dev/null
+}
+
+function list_available_tags() {
+  git -C "$ROOT_REPO" tag --sort=-version:refname | head -10 | tr '\n' ', ' | sed 's/, $//'
+}
+
+function validate_tag_exists() {
+  local tag="$1"
+  git -C "$ROOT_REPO" show-ref --verify --quiet "refs/tags/$tag"
+}
+
+function get_gitignore_patterns() {
+  if [[ -f "$ROOT_REPO/.gitignore" ]]; then
+    # Extract patterns that likely represent dependencies/build artifacts to preserve
+    grep -E '^(node_modules|\.env|dist|build|coverage|\.next|\.nuxt|target|\.gradle|\.idea|\.vscode|\.DS_Store)' "$ROOT_REPO/.gitignore" 2>/dev/null | grep -v '^#'
+  fi
+}
+
+function copy_preserved_files() {
+  local dest_path="$1"
+  local patterns=$(get_gitignore_patterns)
+  
+  if [[ -n "$patterns" ]]; then
+    echo "📦 Copying preserved files..."
+    while IFS= read -r pattern; do
+      # Remove leading/trailing whitespace and skip empty lines
+      pattern=$(echo "$pattern" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      [[ -z "$pattern" ]] && continue
+      
+      # Find all instances of this pattern recursively
+      if [[ "$pattern" =~ ^\. ]]; then
+        # Hidden files/directories (like .env, .DS_Store)
+        while IFS= read -r -d '' src_file; do
+          if [[ -f "$src_file" ]] || [[ -d "$src_file" ]]; then
+            # Get relative path from root repo
+            local rel_path="${src_file#$ROOT_REPO/}"
+            local dest_dir="$dest_path/$(dirname "$rel_path")"
+            mkdir -p "$dest_dir"
+            cp -R "$src_file" "$dest_dir/" 2>/dev/null
+            echo "  ✓ Copied $rel_path"
+          fi
+        done < <(find "$ROOT_REPO" -name "$pattern" -print0 2>/dev/null)
+      else
+        # Regular directories (like node_modules, dist)
+        while IFS= read -r -d '' src_dir; do
+          if [[ -d "$src_dir" ]]; then
+            # Get relative path from root repo
+            local rel_path="${src_dir#$ROOT_REPO/}"
+            local dest_dir="$dest_path/$(dirname "$rel_path")"
+            mkdir -p "$dest_dir"
+            cp -R "$src_dir" "$dest_dir/" 2>/dev/null
+            echo "  ✓ Copied $rel_path"
+          fi
+        done < <(find "$ROOT_REPO" -name "$pattern" -type d -print0 2>/dev/null)
+      fi
+    done <<< "$patterns"
+  fi
+}
+
 function create_session() {
   # Get branch name
   branch=$(gum input --placeholder "New branch name (e.g. fix/gh-1083)")
@@ -71,40 +132,94 @@ function create_session() {
     fi
   fi
 
-  while true; do
-    # Show clear prompt with helper text
-    base=$(gum input --header "Which branch should this new worktree branch from?" --placeholder "Base branch to create from" --value "$DEFAULT_BASE_BRANCH")
-    if [ -z "$base" ]; then
-      echo "🚫 No base branch provided."
-      return
-    fi
-
-    # Validate that the branch exists
-    if validate_branch_exists "$base"; then
-      break
-    else
-      available_branches=$(list_available_branches)
-      echo "❌ Branch '$base' does not exist. Available branches: $available_branches"
-      
-      retry_choice=$(gum choose --header "What would you like to do?" "🔄 Try again" "❌ Cancel")
-      if [[ "$retry_choice" == "❌ Cancel" ]]; then
+  # Ask user to choose between branch or tag
+  source_type=$(gum choose --header "What should this new worktree branch from?" "📋 Branch" "🏷️ Tag (latest)" "🏷️ Tag (specify)")
+  
+  if [[ "$source_type" == "📋 Branch" ]]; then
+    while true; do
+      # Show clear prompt with helper text
+      base=$(gum input --header "Which branch should this new worktree branch from?" --placeholder "Base branch to create from" --value "$DEFAULT_BASE_BRANCH")
+      if [ -z "$base" ]; then
+        echo "🚫 No base branch provided."
         return
       fi
-      # Continue loop to try again
-    fi
-  done
 
-  # Save new default if different
-  if [[ "$base" != "$DEFAULT_BASE_BRANCH" ]]; then
+      # Validate that the branch exists
+      if validate_branch_exists "$base"; then
+        break
+      else
+        available_branches=$(list_available_branches)
+        echo "❌ Branch '$base' does not exist. Available branches: $available_branches"
+        
+        retry_choice=$(gum choose --header "What would you like to do?" "🔄 Try again" "❌ Cancel")
+        if [[ "$retry_choice" == "❌ Cancel" ]]; then
+          return
+        fi
+        # Continue loop to try again
+      fi
+    done
+  elif [[ "$source_type" == "🏷️ Tag (latest)" ]]; then
+    base=$(get_latest_tag)
+    if [ -z "$base" ]; then
+      echo "❌ No tags found in this repository."
+      return
+    fi
+    echo "📌 Using latest tag: $base"
+  else # Tag (specify)
+    latest_tag=$(get_latest_tag)
+    available_tags=$(list_available_tags)
+    echo "💡 Latest tag: $latest_tag"
+    echo "📋 Recent tags: $available_tags"
+    
+    while true; do
+      base=$(gum input --header "Which tag should this new worktree branch from?" --placeholder "Tag name (e.g. v1.0.1)" --value "$latest_tag")
+      if [ -z "$base" ]; then
+        echo "🚫 No tag provided."
+        return
+      fi
+
+      # Validate that the tag exists
+      if validate_tag_exists "$base"; then
+        break
+      else
+        echo "❌ Tag '$base' does not exist. Available tags: $available_tags"
+        
+        retry_choice=$(gum choose --header "What would you like to do?" "🔄 Try again" "❌ Cancel")
+        if [[ "$retry_choice" == "❌ Cancel" ]]; then
+          return
+        fi
+        # Continue loop to try again
+      fi
+    done
+  fi
+
+  # Save new default if different (only for branches)
+  if [[ "$source_type" == "📋 Branch" ]] && [[ "$base" != "$DEFAULT_BASE_BRANCH" ]]; then
     echo "DEFAULT_BASE_BRANCH=$base" > "$CONFIG_FILE"
     echo "📁 Saved '$base' as default base branch for this repo."
     DEFAULT_BASE_BRANCH="$base"
   fi
 
+  # Ask about preserving dependencies
+  preserve_deps="No"
+  if [[ -n "$(get_gitignore_patterns)" ]]; then
+    preserve_deps=$(gum choose --header "Copy dependencies from main repo?" "📦 Yes (faster setup)" "🧹 No (fresh start)")
+  fi
+
   # Create the worktree
   path="$SESSIONS_DIR/$(echo $branch | tr '/' '-')"
   if git -C "$ROOT_REPO" worktree add "$path" -b "$branch" "$base" 2>/dev/null; then
-    echo "✅ Worktree created: $path (from $base)"
+    if [[ "$source_type" == "📋 Branch" ]]; then
+      echo "✅ Worktree created: $path (from branch $base)"
+    else
+      echo "✅ Worktree created: $path (from tag $base)"
+    fi
+    
+    # Copy preserved files if requested
+    if [[ "$preserve_deps" == "📦 Yes (faster setup)" ]]; then
+      copy_preserved_files "$path"
+    fi
+    
     open_session "$(basename "$path")"
   else
     echo "❌ Failed to create worktree. The branch '$branch' may already exist."
@@ -125,10 +240,36 @@ function delete_session() {
 function open_session() {
   session="$1"
   path="$SESSIONS_DIR/$session"
+  
+  # Build claude command with common options (always use pure Sonnet)
+  claude_cmd="claude --model sonnet"
+  
+  # Quick launch options - only show if we have common use cases
+  launch_option=$(gum choose --header "Launch Claude with:" "🚀 Standard" "⚡ Skip permissions" "🔄 Resume session" "⚙️ Custom flags")
+  
+  case $launch_option in
+    "⚡ Skip permissions")
+      claude_cmd="claude --model sonnet --dangerously-skip-permissions"
+      ;;
+    "🔄 Resume session")
+      claude_cmd="claude --model sonnet --resume"
+      ;;
+    "⚙️ Custom flags")
+      flags=$(gum input --placeholder "Additional flags (e.g. --resume --dangerously-skip-permissions)")
+      if [[ -n "$flags" ]]; then
+        claude_cmd="claude --model sonnet $flags"
+      else
+        claude_cmd="claude --model sonnet"
+      fi
+      ;;
+    *)
+      claude_cmd="claude --model sonnet"
+      ;;
+  esac
 
   osascript <<EOF
 tell application "Terminal"
-  do script "cd \"$path\" && claude"
+  do script "cd \"$path\" && $claude_cmd"
   activate
 end tell
 EOF
