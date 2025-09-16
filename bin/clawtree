@@ -344,6 +344,7 @@ function create_session() {
     fi
     
     open_session "$session_id"
+    echo "🎉 Session ready! Return to main menu to launch it."
   else
     echo "❌ Failed to create worktree. The branch '$branch' may already exist."
   fi
@@ -382,6 +383,33 @@ function delete_session() {
   }
 }
 
+function launch_in_terminal() {
+  local path="$1"
+  local claude_cmd="$2"
+  
+  osascript <<EOF
+tell application "Terminal"
+  do script "cd \"$path\" && $claude_cmd"
+  activate
+end tell
+EOF
+}
+
+function launch_in_iterm() {
+  local path="$1"
+  local claude_cmd="$2"
+  
+  osascript <<EOF
+tell application "iTerm2"
+  create window with default profile
+  tell current session of current window
+    write text "cd \"$path\" && $claude_cmd"
+  end tell
+  activate
+end tell
+EOF
+}
+
 function open_session() {
   local session_id="$1"
   local path="$SESSIONS_DIR/$session_id"
@@ -390,7 +418,7 @@ function open_session() {
   claude_cmd="claude --model sonnet"
   
   # Quick launch options - only show if we have common use cases
-  launch_option=$(gum choose --header "Launch Claude with:" "🚀 Standard" "⚡ Skip permissions" "🔄 Resume session" "⚙️ Custom flags")
+  launch_option=$(gum choose --header "Launch Claude with:" "🚀 Standard" "⚡ Skip permissions" "🔄 Resume session" "⚙️ Custom flags" "❌ Cancel")
   
   case $launch_option in
     "⚡ Skip permissions")
@@ -407,17 +435,34 @@ function open_session() {
         claude_cmd="claude --model sonnet"
       fi
       ;;
+    "❌ Cancel")
+      return  # Exit without launching anything
+      ;;
     *)
       claude_cmd="claude --model sonnet"
       ;;
   esac
-
-  osascript <<EOF
-tell application "Terminal"
-  do script "cd \"$path\" && $claude_cmd"
-  activate
-end tell
-EOF
+  
+  # Choose terminal application
+  terminal_choice=$(gum choose --header "Choose terminal:" "💻 Terminal" "🚀 iTerm" "❌ Cancel")
+  
+  case $terminal_choice in
+    "💻 Terminal")
+      launch_in_terminal "$path" "$claude_cmd"
+      ;;
+    "🚀 iTerm")
+      # Check if iTerm is installed
+      if ! osascript -e 'tell application "System Events" to return (exists application process "iTerm2")' 2>/dev/null && ! ls /Applications/iTerm.app 2>/dev/null >/dev/null; then
+        echo "⚠️  iTerm not found. Falling back to Terminal."
+        launch_in_terminal "$path" "$claude_cmd"
+      else
+        launch_in_iterm "$path" "$claude_cmd"
+      fi
+      ;;
+    "❌ Cancel")
+      return  # Exit without launching anything
+      ;;
+  esac
 }
 
 function open_vscode() {
