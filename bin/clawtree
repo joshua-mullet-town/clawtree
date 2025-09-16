@@ -7,9 +7,21 @@ if [[ -z "$ROOT_REPO" ]]; then
 fi
 
 SESSIONS_DIR="$ROOT_REPO/.clawtree-sessions"
+REGISTRY_FILE="$SESSIONS_DIR/registry.json"
 CONFIG_FILE="$ROOT_REPO/.clawtree-config"
 
 mkdir -p "$SESSIONS_DIR"
+
+# Initialize registry if it doesn't exist
+if [[ ! -f "$REGISTRY_FILE" ]]; then
+  echo '{"sessions":{}}' > "$REGISTRY_FILE"
+fi
+
+# Check for jq availability and warn if not found
+if ! command -v jq >/dev/null 2>&1; then
+  echo "⚠️  Warning: 'jq' not found. Using fallback JSON parsing (less reliable)."
+  echo "    Install jq for better performance: brew install jq"
+fi
 
 if [[ -f "$CONFIG_FILE" ]]; then
   source "$CONFIG_FILE"
@@ -17,8 +29,113 @@ else
   DEFAULT_BASE_BRANCH="main"
 fi
 
+function generate_session_id() {
+  # Generate a short UUID-like session ID
+  echo "session-$(openssl rand -hex 4)"
+}
+
 function list_sessions_array() {
-  ls "$SESSIONS_DIR" 2>/dev/null
+  # List sessions from registry, showing friendly names
+  if [[ -f "$REGISTRY_FILE" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      jq -r '.sessions | to_entries[] | "\(.key) (\(.value.branch))"' "$REGISTRY_FILE" 2>/dev/null | awk '{print $1}'
+    else
+      # Fallback: parse JSON manually
+      grep -o '"session-[^"]*"' "$REGISTRY_FILE" 2>/dev/null | tr -d '"' || true
+    fi
+  fi
+}
+
+function get_session_info() {
+  local session_id="$1"
+  local field="$2"
+  if [[ -f "$REGISTRY_FILE" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      jq -r ".sessions[\"$session_id\"].$field // empty" "$REGISTRY_FILE" 2>/dev/null
+    else
+      # Fallback: basic grep parsing
+      case "$field" in
+        "branch")
+          grep -A 3 "\"$session_id\"" "$REGISTRY_FILE" | grep '"branch"' | cut -d'"' -f4 2>/dev/null || echo ""
+          ;;
+        "sessionDir")
+          echo "$session_id"  # Session ID is the directory name
+          ;;
+      esac
+    fi
+  fi
+}
+
+function add_session_to_registry() {
+  local session_id="$1"
+  local branch="$2"
+  local base_branch="$3"
+  local created="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  
+  if command -v jq >/dev/null 2>&1; then
+    # Use jq for proper JSON manipulation
+    local temp_file=$(mktemp)
+    jq ".sessions[\"$session_id\"] = {\"branch\": \"$branch\", \"baseBranch\": \"$base_branch\", \"created\": \"$created\", \"sessionDir\": \"$session_id\"}" "$REGISTRY_FILE" > "$temp_file" && mv "$temp_file" "$REGISTRY_FILE"
+  else
+    # Fallback: manual JSON construction
+    local temp_file=$(mktemp)
+    
+    # Check if this is the first entry
+    if grep -q '"sessions":{}' "$REGISTRY_FILE"; then
+      # First entry - replace empty sessions object
+      echo "{" > "$temp_file"
+      echo "  \"sessions\": {" >> "$temp_file"
+      echo "    \"$session_id\": {" >> "$temp_file"
+      echo "      \"branch\": \"$branch\"," >> "$temp_file"
+      echo "      \"baseBranch\": \"$base_branch\"," >> "$temp_file"
+      echo "      \"created\": \"$created\"," >> "$temp_file"
+      echo "      \"sessionDir\": \"$session_id\"" >> "$temp_file"
+      echo "    }" >> "$temp_file"
+      echo "  }" >> "$temp_file"
+      echo "}" >> "$temp_file"
+    else
+      # Add to existing sessions
+      head -n -2 "$REGISTRY_FILE" > "$temp_file"  # Remove last 2 lines (}} )
+      echo "," >> "$temp_file"
+      echo "    \"$session_id\": {" >> "$temp_file"
+      echo "      \"branch\": \"$branch\"," >> "$temp_file"
+      echo "      \"baseBranch\": \"$base_branch\"," >> "$temp_file"
+      echo "      \"created\": \"$created\"," >> "$temp_file"
+      echo "      \"sessionDir\": \"$session_id\"" >> "$temp_file"
+      echo "    }" >> "$temp_file"
+      echo "  }" >> "$temp_file"
+      echo "}" >> "$temp_file"
+    fi
+    mv "$temp_file" "$REGISTRY_FILE"
+  fi
+}
+
+function remove_session_from_registry() {
+  local session_id="$1"
+  
+  if command -v jq >/dev/null 2>&1; then
+    local temp_file=$(mktemp)
+    jq "del(.sessions[\"$session_id\"])" "$REGISTRY_FILE" > "$temp_file" && mv "$temp_file" "$REGISTRY_FILE"
+  else
+    # Fallback: recreate JSON without the session
+    local temp_file=$(mktemp)
+    echo '{"sessions":{' > "$temp_file"
+    local first=true
+    while IFS= read -r line; do
+      local sid=$(echo "$line" | cut -d' ' -f1)
+      if [[ "$sid" != "$session_id" ]]; then
+        if [[ "$first" != true ]]; then
+          echo "," >> "$temp_file"
+        fi
+        local branch=$(get_session_info "$sid" "branch")
+        local base_branch=$(get_session_info "$sid" "baseBranch")
+        echo "  \"$sid\": {\"branch\": \"$branch\", \"baseBranch\": \"$base_branch\", \"sessionDir\": \"$sid\"}" >> "$temp_file"
+        first=false
+      fi
+    done < <(list_sessions_array)
+    echo '}}' >> "$temp_file"
+    mv "$temp_file" "$REGISTRY_FILE"
+  fi
 }
 
 function detect_default_branch() {
@@ -206,13 +323,19 @@ function create_session() {
     preserve_deps=$(gum choose --header "Copy dependencies from main repo?" "📦 Yes (faster setup)" "🧹 No (fresh start)")
   fi
 
-  # Create the worktree
-  path="$SESSIONS_DIR/$(echo $branch | tr '/' '-')"
+  # Generate unique session ID
+  session_id=$(generate_session_id)
+  path="$SESSIONS_DIR/$session_id"
+  
+  # Create the worktree with UUID-based directory
   if git -C "$ROOT_REPO" worktree add "$path" -b "$branch" "$base" 2>/dev/null; then
+    # Add session to registry with all metadata
+    add_session_to_registry "$session_id" "$branch" "$base"
+    
     if [[ "$source_type" == "📋 Branch" ]]; then
-      echo "✅ Worktree created: $path (from branch $base)"
+      echo "✅ Worktree created: $session_id -> '$branch' (from branch $base)"
     else
-      echo "✅ Worktree created: $path (from tag $base)"
+      echo "✅ Worktree created: $session_id -> '$branch' (from tag $base)"
     fi
     
     # Copy preserved files if requested
@@ -220,26 +343,48 @@ function create_session() {
       copy_preserved_files "$path"
     fi
     
-    open_session "$(basename "$path")"
+    open_session "$session_id"
   else
     echo "❌ Failed to create worktree. The branch '$branch' may already exist."
   fi
 }
 
 function delete_session() {
-  session="$1"
-  path="$SESSIONS_DIR/$session"
-
-  gum confirm "Delete session '$session'?" && {
-    git -C "$ROOT_REPO" worktree remove "$path"
-    git -C "$ROOT_REPO" branch -D "$(echo "$session" | tr '-' '/')"
-    echo "❌ Deleted $session"
+  local session_id="$1"
+  local path="$SESSIONS_DIR/$session_id"
+  
+  # Get the actual branch name from registry
+  local branch=$(get_session_info "$session_id" "branch")
+  
+  if [[ -z "$branch" ]]; then
+    echo "❌ Session '$session_id' not found in registry."
+    return 1
+  fi
+  
+  gum confirm "Delete session '$session_id' (branch: $branch)?" && {
+    # Remove worktree
+    if git -C "$ROOT_REPO" worktree remove "$path" 2>/dev/null; then
+      echo "✅ Removed worktree: $path"
+    else
+      echo "⚠️  Worktree removal failed or already removed"
+    fi
+    
+    # Delete the actual branch using the stored name
+    if git -C "$ROOT_REPO" branch -D "$branch" 2>/dev/null; then
+      echo "✅ Deleted branch: $branch"
+    else
+      echo "⚠️  Branch deletion failed or already deleted"
+    fi
+    
+    # Remove from registry
+    remove_session_from_registry "$session_id"
+    echo "🗑️  Cleaned up session: $session_id"
   }
 }
 
 function open_session() {
-  session="$1"
-  path="$SESSIONS_DIR/$session"
+  local session_id="$1"
+  local path="$SESSIONS_DIR/$session_id"
   
   # Build claude command with common options (always use pure Sonnet)
   claude_cmd="claude --model sonnet"
@@ -276,16 +421,34 @@ EOF
 }
 
 function open_vscode() {
-  session="$1"
-  path="$SESSIONS_DIR/$session"
+  local session_id="$1"
+  local path="$SESSIONS_DIR/$session_id"
   code "$path"
+}
+
+function format_session_display() {
+  local session_id="$1"
+  local branch=$(get_session_info "$session_id" "branch")
+  local base_branch=$(get_session_info "$session_id" "baseBranch")
+  
+  if [[ -n "$branch" ]]; then
+    echo "$session_id → $branch (from $base_branch)"
+  else
+    echo "$session_id (unknown branch)"
+  fi
 }
 
 function dashboard() {
   while true; do
     options=()
-    while IFS= read -r session; do
-      options+=("$session")
+    declare -A session_map
+    
+    # Build display options and maintain session ID mapping
+    while IFS= read -r session_id; do
+      [[ -z "$session_id" ]] && continue
+      display_name=$(format_session_display "$session_id")
+      options+=("$display_name")
+      session_map["$display_name"]="$session_id"
     done < <(list_sessions_array)
 
     options+=("➕ New Session")
@@ -298,26 +461,31 @@ function dashboard() {
     elif [[ "$choice" == "❌ Exit" ]]; then
       break
     elif [[ -n "$choice" ]]; then
-      gum style --bold "Selected: $choice"
-      action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "🗑️ Delete Session" "❌ Cancel")
+      # Extract session ID from display choice
+      session_id="${session_map[$choice]}"
+      
+      if [[ -n "$session_id" ]]; then
+        gum style --bold "Selected: $choice"
+        action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "🗑️ Delete Session" "❌ Cancel")
 
-      case $action in
-        "💬 Launch Claude")
-          open_session "$choice"
-          ;;
-        "💻 Open in VS Code")
-          open_vscode "$choice"
-          ;;
-        "🤖 Launch Both")
-          open_vscode "$choice"
-          open_session "$choice"
-          ;;
-        "🗑️ Delete Session")
-          delete_session "$choice"
-          ;;
-        "❌ Cancel")
-          ;;
-      esac
+        case $action in
+          "💬 Launch Claude")
+            open_session "$session_id"
+            ;;
+          "💻 Open in VS Code")
+            open_vscode "$session_id"
+            ;;
+          "🤖 Launch Both")
+            open_vscode "$session_id"
+            open_session "$session_id"
+            ;;
+          "🗑️ Delete Session")
+            delete_session "$session_id"
+            ;;
+          "❌ Cancel")
+            ;;
+        esac
+      fi
     fi
   done
 }
