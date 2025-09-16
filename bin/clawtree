@@ -209,6 +209,10 @@ function create_session() {
   # Create the worktree
   path="$SESSIONS_DIR/$(echo $branch | tr '/' '-')"
   if git -C "$ROOT_REPO" worktree add "$path" -b "$branch" "$base" 2>/dev/null; then
+    # Store the base branch information for later merge-back capability
+    echo "$base" > "$path/.clawtree-base-branch"
+    echo "$source_type" > "$path/.clawtree-source-type"
+    
     if [[ "$source_type" == "📋 Branch" ]]; then
       echo "✅ Worktree created: $path (from branch $base)"
     else
@@ -281,6 +285,116 @@ function open_vscode() {
   code "$path"
 }
 
+function get_base_branch() {
+  local session="$1"
+  local path="$SESSIONS_DIR/$session"
+  
+  if [[ -f "$path/.clawtree-base-branch" ]]; then
+    cat "$path/.clawtree-base-branch"
+  else
+    echo ""  # No base branch info found
+  fi
+}
+
+function get_source_type() {
+  local session="$1"
+  local path="$SESSIONS_DIR/$session"
+  
+  if [[ -f "$path/.clawtree-source-type" ]]; then
+    cat "$path/.clawtree-source-type"
+  else
+    echo "📋 Branch"  # Default to branch
+  fi
+}
+
+function merge_back_to_base() {
+  local session="$1"
+  local path="$SESSIONS_DIR/$session"
+  local branch=$(echo "$session" | tr '-' '/')
+  local base_branch=$(get_base_branch "$session")
+  local source_type=$(get_source_type "$session")
+  
+  # Validate that we have base branch info
+  if [[ -z "$base_branch" ]]; then
+    echo "❌ Cannot merge: No base branch information found for this session."
+    echo "    This may be an older session created before merge-back support."
+    return 1
+  fi
+  
+  # Don't allow merging back to tags
+  if [[ "$source_type" != "📋 Branch" ]]; then
+    echo "❌ Cannot merge back to a tag. This session was created from: $source_type"
+    return 1
+  fi
+  
+  # Validate that base branch still exists
+  if ! validate_branch_exists "$base_branch"; then
+    echo "❌ Base branch '$base_branch' no longer exists."
+    return 1
+  fi
+  
+  echo "🔄 Merge Back Summary:"
+  echo "  Session: $session"
+  echo "  Branch: $branch"
+  echo "  Target: $base_branch"
+  echo ""
+  
+  # Check if there are uncommitted changes in the session
+  if ! git -C "$path" diff --quiet || ! git -C "$path" diff --cached --quiet; then
+    echo "⚠️  Warning: Uncommitted changes detected in session."
+    commit_first=$(gum choose --header "What would you like to do?" "💾 Commit changes first" "🧨 Stash changes and continue" "❌ Cancel merge")
+    
+    case $commit_first in
+      "💾 Commit changes first")
+        echo "📝 Please commit your changes in the session, then try merge again."
+        return 1
+        ;;
+      "🧨 Stash changes and continue")
+        echo "🧨 Stashing uncommitted changes..."
+        git -C "$path" stash push -m "clawtree: stashed before merge back to $base_branch"
+        ;;
+      "❌ Cancel merge")
+        return 1
+        ;;
+    esac
+  fi
+  
+  # Final confirmation
+  if ! gum confirm "Proceed with merging '$branch' into '$base_branch'?"; then
+    return 1
+  fi
+  
+  echo "🔄 Starting merge process..."
+  
+  # Switch to base branch in main repo
+  if ! git -C "$ROOT_REPO" checkout "$base_branch" 2>/dev/null; then
+    echo "❌ Failed to checkout base branch '$base_branch'"
+    return 1
+  fi
+  
+  # Pull latest changes (if remote tracking exists)
+  if git -C "$ROOT_REPO" rev-parse --abbrev-ref "$base_branch@{upstream}" >/dev/null 2>&1; then
+    echo "🔄 Pulling latest changes for $base_branch..."
+    git -C "$ROOT_REPO" pull
+  fi
+  
+  # Perform the merge
+  if git -C "$ROOT_REPO" merge "$branch" --no-ff -m "Merge branch '$branch' (from clawtree session $session)" 2>/dev/null; then
+    echo "✅ Successfully merged '$branch' into '$base_branch'"
+    
+    # Ask if user wants to delete the session after successful merge
+    if gum confirm "Merge successful! Delete the clawtree session '$session'?"; then
+      delete_session "$session"
+    else
+      echo "📝 Session '$session' kept for reference."
+    fi
+  else
+    echo "❌ Merge failed! There may be conflicts that need manual resolution."
+    echo "    You can resolve conflicts in the main repo and complete the merge manually."
+    return 1
+  fi
+}
+
 function dashboard() {
   while true; do
     options=()
@@ -299,7 +413,16 @@ function dashboard() {
       break
     elif [[ -n "$choice" ]]; then
       gum style --bold "Selected: $choice"
-      action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "🗑️ Delete Session" "❌ Cancel")
+      
+      # Check if this session supports merge back
+      base_branch=$(get_base_branch "$choice")
+      source_type=$(get_source_type "$choice")
+      
+      if [[ -n "$base_branch" ]] && [[ "$source_type" == "📋 Branch" ]]; then
+        action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "🔄 Merge Back to $base_branch" "🗑️ Delete Session" "❌ Cancel")
+      else
+        action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "🗑️ Delete Session" "❌ Cancel")
+      fi
 
       case $action in
         "💬 Launch Claude")
@@ -311,6 +434,9 @@ function dashboard() {
         "🤖 Launch Both")
           open_vscode "$choice"
           open_session "$choice"
+          ;;
+        "🔄 Merge Back to"*)
+          merge_back_to_base "$choice"
           ;;
         "🗑️ Delete Session")
           delete_session "$choice"
