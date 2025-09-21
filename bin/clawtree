@@ -35,15 +35,7 @@ function generate_session_id() {
 }
 
 function list_sessions_array() {
-  # List sessions from registry, showing friendly names
-  if [[ -f "$REGISTRY_FILE" ]]; then
-    if command -v jq >/dev/null 2>&1; then
-      jq -r '.sessions | to_entries[] | "\(.key) (\(.value.branch))"' "$REGISTRY_FILE" 2>/dev/null | awk '{print $1}'
-    else
-      # Fallback: parse JSON manually
-      grep -o '"session-[^"]*"' "$REGISTRY_FILE" 2>/dev/null | tr -d '"' || true
-    fi
-  fi
+  ls "$SESSIONS_DIR" 2>/dev/null | grep -v "registry.json"
 }
 
 function get_session_info() {
@@ -185,61 +177,144 @@ function validate_tag_exists() {
   git -C "$ROOT_REPO" show-ref --verify --quiet "refs/tags/$tag"
 }
 
-function get_gitignore_patterns() {
-  if [[ -f "$ROOT_REPO/.gitignore" ]]; then
-    # Extract patterns that likely represent dependencies/build artifacts to preserve
-    grep -E '^(node_modules|\.env|dist|build|coverage|\.next|\.nuxt|target|\.gradle|\.idea|\.vscode|\.DS_Store)' "$ROOT_REPO/.gitignore" 2>/dev/null | grep -v '^#'
+function detect_copy_candidates() {
+  local candidates=()
+  
+  # Find top-level node_modules directories and count total nested ones
+  local toplevel_dirs=()
+  local total_nested=0
+  
+  while IFS= read -r -d '' nm_dir; do
+    local rel_path="${nm_dir#$ROOT_REPO/}"
+    if [[ ! "$rel_path" =~ node_modules.*node_modules ]]; then
+      # This is a top-level node_modules
+      local size=$(du -sh "$nm_dir" 2>/dev/null | cut -f1)
+      toplevel_dirs+=("$rel_path ($size)")
+    fi
+    total_nested=$((total_nested + 1))
+  done < <(find "$ROOT_REPO" -name "node_modules" -type d -print0 2>/dev/null)
+  
+  if [[ ${#toplevel_dirs[@]} -gt 0 ]]; then
+    candidates+=("📦 All dependencies (${#toplevel_dirs[@]} main dirs, $total_nested total) - skips npm install")
+    for dir in "${toplevel_dirs[@]}"; do
+      candidates+=("   • $dir")
+    done
+  fi
+  
+  # Find all .env files
+  while IFS= read -r -d '' env_file; do
+    local rel_path="${env_file#$ROOT_REPO/}"
+    candidates+=("🔐 $rel_path - environment config")
+  done < <(find "$ROOT_REPO" -name ".env*" -type f -print0 2>/dev/null)
+  
+  # Output candidates if any found
+  if [[ ${#candidates[@]} -gt 0 ]]; then
+    printf "%s\n" "${candidates[@]}"
   fi
 }
 
-function copy_preserved_files() {
+function copy_smart_dependencies() {
   local dest_path="$1"
-  local patterns=$(get_gitignore_patterns)
+  local copy_mode="$2"  # "all", "selective", or "none"
   
-  if [[ -n "$patterns" ]]; then
-    echo "📦 Copying preserved files..."
-    while IFS= read -r pattern; do
-      # Remove leading/trailing whitespace and skip empty lines
-      pattern=$(echo "$pattern" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-      [[ -z "$pattern" ]] && continue
-      
-      # Find all instances of this pattern recursively
-      if [[ "$pattern" =~ ^\. ]]; then
-        # Hidden files/directories (like .env, .DS_Store)
-        while IFS= read -r -d '' src_file; do
-          if [[ -f "$src_file" ]] || [[ -d "$src_file" ]]; then
-            # Get relative path from root repo
-            local rel_path="${src_file#$ROOT_REPO/}"
-            local dest_dir="$dest_path/$(dirname "$rel_path")"
-            mkdir -p "$dest_dir"
-            cp -R "$src_file" "$dest_dir/" 2>/dev/null
-            echo "  ✓ Copied $rel_path"
-          fi
-        done < <(find "$ROOT_REPO" -name "$pattern" -print0 2>/dev/null)
-      else
-        # Regular directories (like node_modules, dist)
-        while IFS= read -r -d '' src_dir; do
-          if [[ -d "$src_dir" ]]; then
-            # Get relative path from root repo
-            local rel_path="${src_dir#$ROOT_REPO/}"
-            local dest_dir="$dest_path/$(dirname "$rel_path")"
-            mkdir -p "$dest_dir"
-            cp -R "$src_dir" "$dest_dir/" 2>/dev/null
-            echo "  ✓ Copied $rel_path"
-          fi
-        done < <(find "$ROOT_REPO" -name "$pattern" -type d -print0 2>/dev/null)
-      fi
-    done <<< "$patterns"
+  if [[ "$copy_mode" == "none" ]]; then
+    return 0
   fi
+  
+  echo "📦 Copying dependencies to speed up setup..."
+  
+  # Copy ALL node_modules directories (including nested ones - that's the whole point!)
+  local copy_nm=true
+  if [[ "$copy_mode" == "selective" ]]; then
+    if ! gum confirm "Copy all node_modules directories? (skips npm install)"; then
+      copy_nm=false
+      echo "  ⏭️  Skipped node_modules"
+    fi
+  fi
+  
+  if [[ "$copy_nm" == "true" ]]; then
+    echo "  🚀 Copying all node_modules directories..."
+    # Copy top-level node_modules directories (which include all their nested contents)
+    while IFS= read -r -d '' nm_dir; do
+      if [[ -d "$nm_dir" ]]; then
+        local rel_path="${nm_dir#$ROOT_REPO/}"
+        # Only copy top-level ones (not nested inside other node_modules)
+        if [[ ! "$rel_path" =~ node_modules.*node_modules ]]; then
+          local dest_dir="$dest_path/$(dirname "$rel_path")"
+          mkdir -p "$dest_dir"
+          cp -R "$nm_dir" "$dest_dir/" 2>/dev/null
+          echo "    ✅ Copied $rel_path (includes all nested dependencies)"
+        fi
+      fi
+    done < <(find "$ROOT_REPO" -name "node_modules" -type d -print0 2>/dev/null)
+  fi
+  
+  # Copy all .env files
+  while IFS= read -r -d '' env_file; do
+    if [[ -f "$env_file" ]]; then
+      local rel_path="${env_file#$ROOT_REPO/}"
+      local dest_dir="$dest_path/$(dirname "$rel_path")"
+      mkdir -p "$dest_dir"
+      
+      if [[ "$copy_mode" == "selective" ]]; then
+        if gum confirm "Copy $rel_path?"; then
+          cp "$env_file" "$dest_dir/" 2>/dev/null
+          echo "  ✅ Copied $rel_path"
+        else
+          echo "  ⏭️  Skipped $rel_path"
+        fi
+      else
+        cp "$env_file" "$dest_dir/" 2>/dev/null
+        echo "  ✅ Copied $rel_path"
+      fi
+    fi
+  done < <(find "$ROOT_REPO" -name ".env*" -type f -print0 2>/dev/null)
+}
+
+function sanitize_branch_name() {
+  local original="$1"
+  # Replace spaces with hyphens, remove other invalid characters
+  local sanitized=$(echo "$original" | sed 's/ /-/g' | sed 's/[^a-zA-Z0-9/_-]//g')
+  echo "$sanitized"
 }
 
 function create_session() {
   # Get branch name
-  branch=$(gum input --placeholder "New branch name (e.g. fix/gh-1083)")
-  if [ -z "$branch" ]; then
-    echo "🚫 No branch name provided."
-    return
-  fi
+  while true; do
+    branch=$(gum input --placeholder "New branch name (e.g. fix/gh-1083)")
+    if [ -z "$branch" ]; then
+      echo "🚫 No branch name provided."
+      return
+    fi
+    
+    # Check if branch name needs sanitizing
+    sanitized=$(sanitize_branch_name "$branch")
+    if [[ "$branch" != "$sanitized" ]]; then
+      echo "⚠️  Branch name contains invalid characters."
+      echo "   Original: '$branch'"
+      echo "   Suggested: '$sanitized'"
+      
+      choice=$(gum choose --header "What would you like to do?" \
+        "✅ Use suggested name: '$sanitized'" \
+        "✏️  Enter a different name" \
+        "❌ Cancel")
+      
+      case "$choice" in
+        "✅ Use suggested name:"*)
+          branch="$sanitized"
+          break
+          ;;
+        "✏️  Enter a different name")
+          continue
+          ;;
+        "❌ Cancel")
+          return
+          ;;
+      esac
+    else
+      break
+    fi
+  done
 
   # Detect smart default and update DEFAULT_BASE_BRANCH if needed
   if [[ -z "$DEFAULT_BASE_BRANCH" ]] || [[ "$DEFAULT_BASE_BRANCH" == "main" ]]; then
@@ -317,73 +392,150 @@ function create_session() {
     DEFAULT_BASE_BRANCH="$base"
   fi
 
-  # Ask about preserving dependencies
-  preserve_deps="No"
-  if [[ -n "$(get_gitignore_patterns)" ]]; then
-    preserve_deps=$(gum choose --header "Copy dependencies from main repo?" "📦 Yes (faster setup)" "🧹 No (fresh start)")
+  # Detect what we can copy to speed up setup
+  copy_candidates=$(detect_copy_candidates)
+  
+  if [[ -n "$copy_candidates" ]]; then
+    echo "🚀 Found items that can speed up your setup:"
+    echo "$copy_candidates"
+    echo ""
+    
+    copy_choice=$(gum choose --header "Speed up setup by copying dependencies?" \
+      "📦 Copy all detected items (faster setup)" \
+      "🎯 Let me choose what to copy" \
+      "🧹 Fresh start (no copying)")
+  else
+    copy_choice="🧹 Fresh start (no copying)"
   fi
 
-  # Generate unique session ID
-  session_id=$(generate_session_id)
-  path="$SESSIONS_DIR/$session_id"
+  # Create the worktree using branch name for directory (convert slashes to hyphens)
+  session_name="$(echo $branch | tr '/' '-')"
+  path="$SESSIONS_DIR/$session_name"
   
-  # Create the worktree with UUID-based directory
   if git -C "$ROOT_REPO" worktree add "$path" -b "$branch" "$base" 2>/dev/null; then
-    # Store the base branch information for later merge-back capability
+    # Store ALL the metadata we need for this session
+    echo "$branch" > "$path/.clawtree-branch-name"
     echo "$base" > "$path/.clawtree-base-branch"
     echo "$source_type" > "$path/.clawtree-source-type"
-    # Add session to registry with all metadata
-    add_session_to_registry "$session_id" "$branch" "$base"
     
     if [[ "$source_type" == "📋 Branch" ]]; then
-      echo "✅ Worktree created: $session_id -> '$branch' (from branch $base)"
+      echo "✅ Worktree created: $path (branch '$branch' from $base)"
     else
-      echo "✅ Worktree created: $session_id -> '$branch' (from tag $base)"
+      echo "✅ Worktree created: $path (branch '$branch' from tag $base)"
     fi
     
-    # Copy preserved files if requested
-    if [[ "$preserve_deps" == "📦 Yes (faster setup)" ]]; then
-      copy_preserved_files "$path"
-    fi
+    # Copy dependencies based on user choice
+    case "$copy_choice" in
+      "📦 Copy all detected items (faster setup)")
+        copy_smart_dependencies "$path" "all"
+        ;;
+      "🎯 Let me choose what to copy")
+        copy_smart_dependencies "$path" "selective"
+        ;;
+      *)
+        # Fresh start - no copying
+        ;;
+    esac
     
-    open_session "$session_id"
-    echo "🎉 Session ready! Return to main menu to launch it."
+    echo "✅ Session '$session_name' created successfully!"
+    
+    # Show the same menu as when selecting an existing session
+    show_session_menu "$session_name"
   else
     echo "❌ Failed to create worktree. The branch '$branch' may already exist."
   fi
 }
 
 function delete_session() {
-  local session_id="$1"
-  local path="$SESSIONS_DIR/$session_id"
+  session="$1"
+  skip_confirm="$2"  # "skip" to bypass confirmation
+  path="$SESSIONS_DIR/$session"
+
+  # Get the actual branch name from stored metadata
+  stored_branch=$(get_stored_branch_name "$session")
   
-  # Get the actual branch name from registry
-  local branch=$(get_session_info "$session_id" "branch")
-  
-  if [[ -z "$branch" ]]; then
-    echo "❌ Session '$session_id' not found in registry."
-    return 1
+  # Skip confirmation if called from merge-back
+  if [[ "$skip_confirm" == "skip" ]] || gum confirm "Delete session '$session'?"; then
+    # Force remove worktree (handles modified files)
+    if git -C "$ROOT_REPO" worktree remove --force "$path" 2>/dev/null; then
+      echo "✅ Removed worktree: $session"
+    else
+      echo "⚠️ Worktree already removed"
+    fi
+    
+    # Use stored branch name if available, otherwise try conversion
+    if [[ -n "$stored_branch" ]]; then
+      if git -C "$ROOT_REPO" branch -D "$stored_branch" 2>/dev/null; then
+        echo "✅ Deleted branch: $stored_branch"
+      else
+        echo "⚠️ Branch '$stored_branch' not found"
+      fi
+    else
+      # Fallback for old sessions without stored metadata
+      if [[ "$session" =~ ^session- ]]; then
+        # Old UUID-based sessions
+        branch_name=$(echo "$session" | tr '-' '/')
+        if git -C "$ROOT_REPO" branch -D "$branch_name" 2>/dev/null; then
+          echo "✅ Deleted branch: $branch_name"
+        else
+          echo "⚠️ Branch not found (old session)"
+        fi
+      else
+        # Try converting session name back to branch name
+        branch_name=$(echo "$session" | tr '-' '/')
+        if git -C "$ROOT_REPO" branch -D "$branch_name" 2>/dev/null; then
+          echo "✅ Deleted branch: $branch_name"
+        else
+          echo "⚠️ Branch '$branch_name' not found"
+        fi
+      fi
+    fi
+    
+    echo "🗑️ Session '$session' deleted"
   fi
+}
+
+function show_session_menu() {
+  local session="$1"
   
-  gum confirm "Delete session '$session_id' (branch: $branch)?" && {
-    # Remove worktree
-    if git -C "$ROOT_REPO" worktree remove "$path" 2>/dev/null; then
-      echo "✅ Removed worktree: $path"
-    else
-      echo "⚠️  Worktree removal failed or already removed"
-    fi
-    
-    # Delete the actual branch using the stored name
-    if git -C "$ROOT_REPO" branch -D "$branch" 2>/dev/null; then
-      echo "✅ Deleted branch: $branch"
-    else
-      echo "⚠️  Branch deletion failed or already deleted"
-    fi
-    
-    # Remove from registry
-    remove_session_from_registry "$session_id"
-    echo "🗑️  Cleaned up session: $session_id"
-  }
+  gum style --bold "Selected: $session"
+  
+  # Check if this session supports merge back
+  base_branch=$(get_base_branch "$session")
+  source_type=$(get_source_type "$session")
+  
+  if [[ -n "$base_branch" ]] && [[ "$source_type" == "📋 Branch" ]]; then
+    action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "🔄 Merge & Delete Session" "🔄 Merge & Keep Session" "📝 Edit Description" "🗑️ Delete Session" "❌ Cancel")
+  else
+    action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "📝 Edit Description" "🗑️ Delete Session" "❌ Cancel")
+  fi
+
+  case $action in
+    "💬 Launch Claude")
+      open_session "$session"
+      ;;
+    "💻 Open in VS Code")
+      open_vscode "$session"
+      ;;
+    "🤖 Launch Both")
+      open_vscode "$session"
+      open_session "$session"
+      ;;
+    "🔄 Merge & Delete Session")
+      merge_back_to_base "$session" "delete"
+      ;;
+    "🔄 Merge & Keep Session")
+      merge_back_to_base "$session" "keep"
+      ;;
+    "📝 Edit Description")
+      set_session_description "$session"
+      ;;
+    "🗑️ Delete Session")
+      delete_session "$session"
+      ;;
+    "❌ Cancel")
+      ;;
+  esac
 }
 
 function launch_in_terminal() {
@@ -446,32 +598,55 @@ function open_session() {
       ;;
   esac
   
-  # Choose terminal application
-  terminal_choice=$(gum choose --header "Choose terminal:" "💻 Terminal" "🚀 iTerm" "❌ Cancel")
-  
-  case $terminal_choice in
-    "💻 Terminal")
-      launch_in_terminal "$path" "$claude_cmd"
-      ;;
-    "🚀 iTerm")
-      # Check if iTerm is installed
-      if ! osascript -e 'tell application "System Events" to return (exists application process "iTerm2")' 2>/dev/null && ! ls /Applications/iTerm.app 2>/dev/null >/dev/null; then
-        echo "⚠️  iTerm not found. Falling back to Terminal."
-        launch_in_terminal "$path" "$claude_cmd"
-      else
+  # Auto-detect and default to iTerm2 if available
+  if ls /Applications/iTerm.app 2>/dev/null >/dev/null || osascript -e 'tell application "System Events" to return (exists application process "iTerm2")' 2>/dev/null; then
+    # iTerm2 is available - default to it but offer choice
+    terminal_choice=$(gum choose --header "Choose terminal (iTerm2 recommended):" "🚀 iTerm (default)" "💻 Terminal" "❌ Cancel")
+    
+    case $terminal_choice in
+      "🚀 iTerm (default)")
         launch_in_iterm "$path" "$claude_cmd"
-      fi
-      ;;
-    "❌ Cancel")
-      return  # Exit without launching anything
-      ;;
-  esac
+        ;;
+      "💻 Terminal")
+        launch_in_terminal "$path" "$claude_cmd"
+        ;;
+      "❌ Cancel")
+        return
+        ;;
+    esac
+  else
+    # No iTerm2 - use Terminal directly
+    echo "🚀 Opening in Terminal..."
+    launch_in_terminal "$path" "$claude_cmd"
+  fi
 }
 
 function open_vscode() {
   local session_id="$1"
   local path="$SESSIONS_DIR/$session_id"
-  code "$path"
+  
+  # Try different ways to open VS Code
+  if command -v code &> /dev/null; then
+    code "$path"
+  elif [[ -d "/Applications/Visual Studio Code.app" ]]; then
+    open -a "Visual Studio Code" "$path"
+  else
+    echo "⚠️  VS Code not found. Please install VS Code or add 'code' command to PATH."
+    echo "    You can install the CLI by opening VS Code and running:"
+    echo "    Command Palette (⌘⇧P) → 'Shell Command: Install code command in PATH'"
+  fi
+}
+
+
+function get_stored_branch_name() {
+  local session="$1"
+  local path="$SESSIONS_DIR/$session"
+  
+  if [[ -f "$path/.clawtree-branch-name" ]]; then
+    cat "$path/.clawtree-branch-name"
+  else
+    echo ""  # No branch name stored
+  fi
 }
 
 function get_base_branch() {
@@ -496,12 +671,48 @@ function get_source_type() {
   fi
 }
 
-function merge_back_to_base() {
+function get_session_description() {
   local session="$1"
   local path="$SESSIONS_DIR/$session"
-  local branch=$(echo "$session" | tr '-' '/')
+  
+  if [[ -f "$path/.clawtree-description" ]]; then
+    cat "$path/.clawtree-description"
+  else
+    echo ""  # No description
+  fi
+}
+
+function set_session_description() {
+  local session="$1"
+  local path="$SESSIONS_DIR/$session"
+  
+  echo "📝 Add a description for this session (optional)"
+  echo "   Current: $(get_session_description "$session" || echo "none")"
+  echo ""
+  
+  description=$(gum input --placeholder "Brief description (leave empty to remove)" --value "$(get_session_description "$session")")
+  
+  if [[ -n "$description" ]]; then
+    echo "$description" > "$path/.clawtree-description"
+    echo "✅ Description saved: $description"
+  else
+    rm -f "$path/.clawtree-description"
+    echo "🗑️ Description removed"
+  fi
+}
+
+function merge_back_to_base() {
+  local session="$1"
+  local delete_after="$2"  # "delete" or "keep"
+  local path="$SESSIONS_DIR/$session"
+  local branch=$(get_stored_branch_name "$session")
   local base_branch=$(get_base_branch "$session")
   local source_type=$(get_source_type "$session")
+  
+  # If no stored branch name, fall back to conversion
+  if [[ -z "$branch" ]]; then
+    branch=$(echo "$session" | tr '-' '/')
+  fi
   
   # Validate that we have base branch info
   if [[ -z "$base_branch" ]]; then
@@ -555,6 +766,27 @@ function merge_back_to_base() {
   
   echo "🔄 Starting merge process..."
   
+  # Check for uncommitted changes in main repo before checkout
+  if ! git -C "$ROOT_REPO" diff --quiet || ! git -C "$ROOT_REPO" diff --cached --quiet; then
+    echo "⚠️  Warning: Uncommitted changes detected in main repository."
+    echo "    These changes could interfere with the checkout and merge process."
+    main_repo_action=$(gum choose --header "What would you like to do?" "💾 Commit changes in main repo first" "🧨 Stash changes and continue" "❌ Cancel merge")
+    
+    case $main_repo_action in
+      "💾 Commit changes in main repo first")
+        echo "📝 Please commit your changes in the main repo, then try merge again."
+        return 1
+        ;;
+      "🧨 Stash changes and continue")
+        echo "🧨 Stashing uncommitted changes in main repo..."
+        git -C "$ROOT_REPO" stash push -m "clawtree: stashed before merge of $branch"
+        ;;
+      "❌ Cancel merge")
+        return 1
+        ;;
+    esac
+  fi
+  
   # Switch to base branch in main repo
   if ! git -C "$ROOT_REPO" checkout "$base_branch" 2>/dev/null; then
     echo "❌ Failed to checkout base branch '$base_branch'"
@@ -571,9 +803,10 @@ function merge_back_to_base() {
   if git -C "$ROOT_REPO" merge "$branch" --no-ff -m "Merge branch '$branch' (from clawtree session $session)" 2>/dev/null; then
     echo "✅ Successfully merged '$branch' into '$base_branch'"
     
-    # Ask if user wants to delete the session after successful merge
-    if gum confirm "Merge successful! Delete the clawtree session '$session'?"; then
-      delete_session "$session"
+    # Handle session cleanup based on user's upfront choice
+    if [[ "$delete_after" == "delete" ]]; then
+      echo "🗑️ Cleaning up session as requested..."
+      delete_session "$session" "skip"
     else
       echo "📝 Session '$session' kept for reference."
     fi
@@ -581,101 +814,89 @@ function merge_back_to_base() {
     echo "❌ Merge failed! There may be conflicts that need manual resolution."
     echo "    You can resolve conflicts in the main repo and complete the merge manually."
     return 1
-    
+  fi
+}
+
+function check_session_status() {
+  local session="$1"
+  local path="$SESSIONS_DIR/$session"
+  
+  if [[ ! -d "$path" ]]; then
+    echo "❌"  # Missing directory
+    return
+  fi
+  
+  # Check for uncommitted changes
+  if ! git -C "$path" diff --quiet 2>/dev/null || ! git -C "$path" diff --cached --quiet 2>/dev/null; then
+    echo "🟡"  # Uncommitted changes
+  else
+    echo "🟢"  # Clean
+  fi
+}
+
 function format_session_display() {
   local session_id="$1"
-  local branch=$(get_session_info "$session_id" "branch")
-  local base_branch=$(get_session_info "$session_id" "baseBranch")
+  local status=$(check_session_status "$session_id")
+  local branch=$(get_stored_branch_name "$session_id")
+  local description=$(get_session_description "$session_id")
   
-  if [[ -n "$branch" ]]; then
-    echo "$session_id → $branch (from $base_branch)"
+  if [[ -z "$branch" ]]; then
+    branch=$(echo "$session_id" | tr '-' '/')
+  fi
+  
+  # Only show arrow if branch name is different from session name
+  local session_as_branch=$(echo "$session_id" | tr '-' '/')
+  if [[ "$branch" == "$session_as_branch" ]] || [[ "$branch" == "$session_id" ]]; then
+    # Branch and session name are the same, just show session
+    if [[ -n "$description" ]]; then
+      echo "$status $session_id \"$description\""
+    else
+      echo "$status $session_id"
+    fi
   else
-    echo "$session_id (unknown branch)"
+    # Branch is different, show the arrow
+    if [[ -n "$description" ]]; then
+      echo "$status $session_id → $branch \"$description\""
+    else
+      echo "$status $session_id → $branch"
+    fi
   fi
 }
 
 function dashboard() {
   while true; do
     options=()
-    declare -A session_map
+    session_map=()  # Track original session names
     
-    # Build display options and maintain session ID mapping
-    while IFS= read -r session_id; do
-      [[ -z "$session_id" ]] && continue
-      display_name=$(format_session_display "$session_id")
-      options+=("$display_name")
-      session_map["$display_name"]="$session_id"
+    while IFS= read -r session; do
+      formatted=$(format_session_display "$session")
+      options+=("$formatted")
+      session_map+=("$session")
     done < <(list_sessions_array)
 
     options+=("➕ New Session")
     options+=("❌ Exit")
 
-    choice=$(printf "%s\n" "${options[@]}" | gum choose --header="🧠 Clawtree Sessions")
+    if [[ ${#session_map[@]} -gt 0 ]]; then
+      header="🧠 Clawtree Sessions (🟢=clean 🟡=changes ❌=error)"
+    else
+      header="🧠 Clawtree Sessions"
+    fi
+
+    choice=$(printf "%s\n" "${options[@]}" | gum choose --header="$header")
 
     if [[ "$choice" == "➕ New Session" ]]; then
       create_session
     elif [[ "$choice" == "❌ Exit" ]]; then
       break
     elif [[ -n "$choice" ]]; then
-    
-      gum style --bold "Selected: $choice"
-      
-      # Check if this session supports merge back
-      base_branch=$(get_base_branch "$choice")
-      source_type=$(get_source_type "$choice")
-      
-      if [[ -n "$base_branch" ]] && [[ "$source_type" == "📋 Branch" ]]; then
-        action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "🔄 Merge Back to $base_branch" "🗑️ Delete Session" "❌ Cancel")
-      else
-        action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "🗑️ Delete Session" "❌ Cancel")
-      fi
-
-      case $action in
-        "💬 Launch Claude")
-          open_session "$choice"
-          ;;
-        "💻 Open in VS Code")
-          open_vscode "$choice"
-          ;;
-        "🤖 Launch Both")
-          open_vscode "$choice"
-          open_session "$choice"
-          ;;
-        "🔄 Merge Back to"*)
-          merge_back_to_base "$choice"
-          ;;
-        "🗑️ Delete Session")
-          delete_session "$choice"
-          ;;
-        "❌ Cancel")
-          ;;
-      esac
-      
-      # Extract session ID from display choice
-      session_id="${session_map[$choice]}"
-      
-      if [[ -n "$session_id" ]]; then
-        gum style --bold "Selected: $choice"
-        action=$(gum choose "💬 Launch Claude" "💻 Open in VS Code" "🤖 Launch Both" "🗑️ Delete Session" "❌ Cancel")
-
-        case $action in
-          "💬 Launch Claude")
-            open_session "$session_id"
-            ;;
-          "💻 Open in VS Code")
-            open_vscode "$session_id"
-            ;;
-          "🤖 Launch Both")
-            open_vscode "$session_id"
-            open_session "$session_id"
-            ;;
-          "🗑️ Delete Session")
-            delete_session "$session_id"
-            ;;
-          "❌ Cancel")
-            ;;
-        esac
-      fi
+      # Find the original session name from the formatted choice
+      for i in "${!session_map[@]}"; do
+        if [[ "${options[$i]}" == "$choice" ]]; then
+          show_session_menu "${session_map[$i]}"
+          break
+        fi
+      done
     fi
   done
 }
