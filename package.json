@@ -1,6 +1,6 @@
 {
   "name": "clawtree",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "A minimal Claude Code worktree manager with a terminal UI",
   "keywords": [
     "git",
