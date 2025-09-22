@@ -35,6 +35,41 @@ This is a simple bash script project with no build process, tests, or linting co
 ./bin/clawtree
 ```
 
+## Release Workflow
+
+ClawTree uses a **push-first, release-second** workflow for publishing:
+
+### 1. Push Your Code (Normal Development)
+```bash
+git add .
+git commit -m "Your changes"
+git push origin main
+```
+
+### 2. Create Release (Manual GitHub Actions)
+1. Go to **GitHub Actions** tab in the repository
+2. Click **"Release and Publish to NPM"** workflow
+3. Click **"Run workflow"** button
+4. Select version type: **patch** (1.2.1→1.2.2) | **minor** (1.2.1→1.3.0) | **major** (1.2.1→2.0.0)
+5. Click **"Run workflow"**
+
+**What happens automatically:**
+- ✅ Version gets bumped in package.json
+- ✅ Git tag gets created (v1.2.2)
+- ✅ Package gets published to NPM
+- ✅ GitHub Release gets created
+- ✅ Changes get pushed back to main branch
+
+### 3. Local Version Commands (Optional)
+These commands are available for local testing but **do NOT publish**:
+```bash
+npm run patch   # Bumps version locally only
+npm run minor   # Bumps version locally only  
+npm run major   # Bumps version locally only
+```
+
+**Note:** The old auto-publishing workflow has been replaced with manual GitHub Actions to prevent accidental releases and give better control over release timing.
+
 ## Key Implementation Details
 
 - Uses `git worktree` commands for all worktree operations

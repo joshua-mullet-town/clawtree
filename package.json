@@ -41,8 +41,7 @@
     "patch": "npm version patch",
     "minor": "npm version minor",
     "major": "npm version major",
-    "prepublishOnly": "echo 'Publishing clawtree...'",
-    "postversion": "git push && git push --tags"
+    "prepublishOnly": "echo 'Publishing clawtree...'"
   },
   "engines": {
     "node": ">=16.0.0"

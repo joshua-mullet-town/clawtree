@@ -1,9 +1,17 @@
-name: Publish to NPM
+name: Release and Publish to NPM
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version_type:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+        - patch
+        - minor
+        - major
 
 jobs:
   publish:
@@ -27,21 +35,37 @@ jobs:
           ls -la bin/clawtree
           chmod +x bin/clawtree
           
+      - name: Bump version and create tag
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          npm version ${{ github.event.inputs.version_type }}
+          
+      - name: Get package version
+        id: get_version
+        run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+          
       - name: Publish to NPM
         run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          
+      - name: Push changes and tags
+        run: |
+          git push origin main
+          git push origin --tags
           
       - name: Create GitHub Release
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
+          tag_name: v${{ steps.get_version.outputs.version }}
+          release_name: Release v${{ steps.get_version.outputs.version }}
           body: |
             New release of ClawTree CLI
             
+            Version: ${{ github.event.inputs.version_type }}
             Install with: `npm install -g clawtree`
           draft: false
           prerelease: false
